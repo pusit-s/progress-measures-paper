@@ -5,41 +5,40 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 import sys
+import pandas as pd
 from transformers import Transformer, Config
 
-# Add current directory to path so we can import the uploaded file
+# Import the provided Transformer module
 sys.path.append('.')
 
-# ==========================================
-# 1. Experiment Configuration
-# ==========================================
+# ===========================
+# 1. Configuration
+# ===========================
 
-# We will sweep fractions from 0.1 to 0.9
 FRACTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-# Constants for Modular Addition
 P = 113
-TOTAL_STEPS = 20000  # Steps to run for each fraction
-LOG_EVERY = 200      # Log accuracy every N steps
+TOTAL_STEPS = 20000
+LOG_EVERY = 10
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1.0   # High weight decay is crucial for grokking
+WEIGHT_DECAY = 1.0  
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Explicitly disable MPS (Apple Silicon) as requested, use CUDA or CPU
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
 
-# Set deterministic seeds
 torch.manual_seed(42)
 np.random.seed(42)
 
-# ==========================================
-# 2. Helper Functions
-# ==========================================
+# ===========================
+# 2. Data & Model Setup
+# ===========================
 
 def create_data(p, fraction):
-    """
-    Generates modular addition data (a + b) % p and splits based on fraction.
-    """
-    # Create all pairs
+    """Generate modular addition data and split by fraction."""
+    # Generate all pairs
     a = torch.arange(p)
     b = torch.arange(p)
     x, y = torch.meshgrid(a, b, indexing='ij')
@@ -58,134 +57,136 @@ def create_data(p, fraction):
     
     return train_x.to(DEVICE), train_y.to(DEVICE), test_x.to(DEVICE), test_y.to(DEVICE)
 
-def calculate_accuracy(model, x, y):
+def evaluate(model, x, y, criterion):
     model.eval()
     with torch.no_grad():
         logits = model(x)
-        # Prediction at the last token position
-        preds = logits[:, -1, :].argmax(dim=-1)
+        final_logits = logits[:, -1, :]
+        loss = criterion(final_logits, y)
+        preds = final_logits.argmax(dim=-1)
         acc = (preds == y).float().mean().item()
     model.train()
-    return acc
+    return loss.item(), acc
 
-def run_training_for_fraction(fraction):
-    """
-    Trains a fresh model for a specific data fraction and returns the accuracy history.
-    """
-    print(f"\n--- Running for Fraction: {fraction} ---")
+def train_fraction(frac):
+    print(f"--- Training Data Fraction: {frac} ---")
+    train_x, train_y, test_x, test_y = create_data(P, frac)
     
-    # 1. Data
-    train_x, train_y, test_x, test_y = create_data(P, fraction)
-    
-    # 2. Config & Model
-    # We use the Config class from the uploaded file
-    # We disable the MLP (d_mlp=0) to keep it an attention-only transformer 
-    # similar to the simpler setups in grokking papers, but you can enable it if desired.
+    # Paper uses a 1-layer transformer with MLP
     cfg = Config(
         p=P,
         d_model=128,
         num_heads=4,
-        d_mlp=0,        # Set to 0 for Attn-only, or 4*128 for standard
+        d_mlp=512,       # Enabled MLP to match paper architecture
         num_layers=1,
         n_ctx=2,
-        d_vocab=P+1,    # transformers.py usually expects p+1 for vocab
+        d_vocab=P+1,
         act_type='ReLU',
         use_ln=False,
         seed=42
     )
     
     model = Transformer(cfg).to(DEVICE)
-    
-    # 3. Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=LEARNING_RATE, 
-        weight_decay=WEIGHT_DECAY
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss()
     
-    # 4. Loop
-    steps_history = []
-    test_acc_history = []
-    grok_step = None
+    # Store history for this fraction
+    history_records = []
     
-    pbar = tqdm(range(TOTAL_STEPS), leave=False)
+    pbar = tqdm(range(TOTAL_STEPS), leave=False, mininterval=60)
     for step in pbar:
         model.train()
         optimizer.zero_grad()
         
         logits = model(train_x)
-        final_logits = logits[:, -1, :]
-        loss = criterion(final_logits, train_y)
+        loss = criterion(logits[:, -1, :], train_y)
         loss.backward()
         optimizer.step()
         
-        if (step % LOG_EVERY == 0) or (step == TOTAL_STEPS - 1):
-            test_acc = calculate_accuracy(model, test_x, test_y)
-            steps_history.append(step)
-            test_acc_history.append(test_acc)
+        # Log metrics
+        if step % LOG_EVERY == 0:
+            train_loss, train_acc = evaluate(model, train_x, train_y, criterion)
+            test_loss, test_acc = evaluate(model, test_x, test_y, criterion)
             
-            pbar.set_description(f"Frac {fraction} | Test Acc: {test_acc:.2f}")
+            history_records.append({
+                'fraction': frac,
+                'step': step,
+                'train_loss': train_loss,
+                'test_loss': test_loss,
+                'train_acc': train_acc,
+                'test_acc': test_acc
+            })
             
-            # Check if grokking occurred (defined as > 99% accuracy)
-            if grok_step is None and test_acc > 0.99:
-                grok_step = step
-                
-    return steps_history, test_acc_history, grok_step
+    return history_records
 
-# ==========================================
-# 3. Main Execution Loop
-# ==========================================
+# ===========================
+# 3. Main Loop & CSV Saving
+# ===========================
 
-results = {}  # Store data for plotting
+if __name__ == "__main__":
+    all_data = []
 
-for frac in FRACTIONS:
-    steps, accs, grok_step = run_training_for_fraction(frac)
-    results[frac] = {
-        'steps': steps,
-        'accs': accs,
-        'grok_step': grok_step
-    }
+    # Run experiment
+    for frac in FRACTIONS:
+        fraction_history = train_fraction(frac)
+        all_data.extend(fraction_history)
 
-print("\nAll training runs complete.")
+    # Save to CSV
+    df = pd.DataFrame(all_data)
+    csv_filename = "grokking_experiment_data.csv"
+    df.to_csv(csv_filename, index=False)
+    print(f"\nTraining complete. Data saved to {csv_filename}")
 
-# ==========================================
-# 4. Plotting
-# ==========================================
+    # ===========================
+    # 4. Plotting
+    # ===========================
+    
+    # --- Plot 1: Accuracy Grid (3x3) ---
+    fig_acc, axes_acc = plt.subplots(3, 3, figsize=(15, 12))
+    axes_acc = axes_acc.flatten()
+    
+    for i, frac in enumerate(FRACTIONS):
+        ax = axes_acc[i]
+        subset = df[df['fraction'] == frac]
+        
+        ax.plot(subset['step'], subset['train_acc'], label='Train', color='blue')
+        ax.plot(subset['step'], subset['test_acc'], label='Test', color='red')
+        
+        ax.set_title(f"Data Fraction {frac}")
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, alpha=0.3)
+        
+        if i >= 6: ax.set_xlabel("Steps")
+        if i % 3 == 0: ax.set_ylabel("Accuracy")
+        if i == 0: ax.legend(loc="lower right")
 
-# Set up a colormap
-colors = plt.cm.viridis(np.linspace(0, 1, len(FRACTIONS)))
+    plt.suptitle("Grokking: Train vs Test Accuracy", fontsize=16)
+    plt.tight_layout()
+    plt.savefig("grokking_accuracy_grid.png", dpi=150)
+    print("Saved accuracy plot to grokking_accuracy_grid.png")
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    # --- Plot 2: Loss Grid (3x3) ---
+    fig_loss, axes_loss = plt.subplots(3, 3, figsize=(15, 12))
+    axes_loss = axes_loss.flatten()
+    
+    for i, frac in enumerate(FRACTIONS):
+        ax = axes_loss[i]
+        subset = df[df['fraction'] == frac]
+        
+        # Log scale for loss (semilogy)
+        ax.semilogy(subset['step'], subset['train_loss'], label='Train', color='blue')
+        ax.semilogy(subset['step'], subset['test_loss'], label='Test', color='red')
+        
+        ax.set_title(f"Data Fraction {frac}")
+        ax.grid(True, which="both", ls="--", alpha=0.3)
+        
+        if i >= 6: ax.set_xlabel("Steps")
+        if i % 3 == 0: ax.set_ylabel("Loss (Log Scale)")
+        if i == 0: ax.legend(loc="upper right")
 
-# --- Plot 1: Test Accuracy Curves ---
-for i, frac in enumerate(FRACTIONS):
-    data = results[frac]
-    ax1.plot(data['steps'], data['accs'], label=f'Frac {frac}', color=colors[i], linewidth=2)
-
-ax1.set_xscale('log') # Grokking plots are usually semilog-x
-ax1.set_xlabel('Optimization Steps', fontsize=12)
-ax1.set_ylabel('Test Accuracy', fontsize=12)
-ax1.set_title(f'Grokking Speed vs Data Fraction (p={P})', fontsize=14)
-ax1.legend(title="Train Fraction")
-ax1.grid(True, which="both", ls="--", alpha=0.5)
-
-# --- Plot 2: Steps to Grok (Phase Transition) ---
-# Filter out runs that never grokked (never reached 99%)
-valid_fracs = [f for f in FRACTIONS if results[f]['grok_step'] is not None]
-grok_steps = [results[f]['grok_step'] for f in valid_fracs]
-
-# If some didn't grok, we can plot them at max_steps to indicate "infinite"
-ax2.plot(valid_fracs, grok_steps, 'o-', color='black', linewidth=2, markersize=8)
-
-ax2.set_xlabel('Training Data Fraction', fontsize=12)
-ax2.set_ylabel('Steps to Reach 99% Accuracy', fontsize=12)
-ax2.set_title('Data Efficiency "Phase Transition"', fontsize=14)
-ax2.grid(True, ls="--", alpha=0.5)
-# Invert y-axis? Often simpler to see "smaller is better". 
-# But standard phase plots often show "Optimization steps required" dropping as Fraction increases.
-
-plt.tight_layout()
-plt.savefig('grokking_fraction_sweep.png', dpi=150)
-print("Plot saved to 'grokking_fraction_sweep.png'")
-plt.show()
+    plt.suptitle("Grokking: Train vs Test Loss", fontsize=16)
+    plt.tight_layout()
+    plt.savefig("grokking_loss_grid.png", dpi=150)
+    print("Saved loss plot to grokking_loss_grid.png")
+    
+    plt.show()

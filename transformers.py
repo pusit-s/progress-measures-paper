@@ -15,7 +15,7 @@ import time
 import torch.nn.functional as F
 import einops
 import random 
-from . import helpers 
+import helpers 
 from dataclasses import dataclass
 import os
 import wandb
