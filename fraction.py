@@ -8,35 +8,26 @@ import sys
 import pandas as pd
 import random
 import os
+import math
 
 # Import the provided Transformer module
 sys.path.append('.')
 try:
     from transformers import Transformer, Config
 except ImportError:
-    # Fallback if file not found locally (for demonstration)
-    pass 
+    pass # Expecting transformers.py to be present
 
 # ===========================
-# 1. Configuration
+# 1. Global Configuration
 # ===========================
 
-# Experiment Setup
-EXPERIMENT_STYLE = 'random'  # Options: 'random', 'strip', 'rect'
-# If 'random': Uses FRACTIONS list. 'k' is ignored.
-# If 'strip'/'rect': Uses 'k' parameter. FRACTIONS list is ignored (run manually or loop k).
-
-FRACTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-K_VALUE = 30  # Only used if style is 'strip' or 'rect'
-
-# Model & Training Constants
 P = 113
 TOTAL_STEPS = 20000
-LOG_EVERY = 10
+LOG_EVERY = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1.0  
+SEED = 42
 
-# Device Configuration (Explicitly disabling MPS as requested)
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
@@ -44,62 +35,45 @@ else:
 print(f"Using device: {DEVICE}")
 
 # Set seeds
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
 # ===========================
-# 2. Data Generation (Adjusted)
+# 2. Data Generation Logic
 # ===========================
 
-def create_data(p, fraction, style='random', k=30, seed=42):
+def create_data(p, fraction, style=None, k=30, seed=42):
     """
-    Generates data for Modular Addition.
-    
-    Logic:
-    - If style='random': Use 'fraction' to determine train size. Ignore 'k'.
-    - If style='strip': Hold out rows 0..k for Test. Train on EVERYTHING else. Ignore 'fraction'.
-    - If style='rect': Hold out box k*k for Test. Train on EVERYTHING else. Ignore 'fraction'.
+    Generates data based on the specific style:
+    - random (or None): Uses 'fraction' to split train/test.
+    - strip: Holds out rows 0..k for Test. Ignores fraction.
+    - rect: Holds out square 0..k x 0..k for Test. Ignores fraction.
     """
-    # 1. Generate all pairs (a, b)
+    random.seed(seed)
     all_pairs = [(i, j) for i in range(p) for j in range(p)]
+    random.shuffle(all_pairs)
     
-    # 2. Define the Test Set based on Style
     if style == 'strip':
-        # Logic from str.py: Test set is rows i in [0, k]
-        # Train set is everything else (fraction is ignored)
+        # Hold out first k rows
         test_pairs_set = set((i, j) for i in range(k + 1) for j in range(p))
-        
         train_pairs = [p for p in all_pairs if p not in test_pairs_set]
-        test_pairs = list(test_pairs_set)
+        test_pairs = [p for p in all_pairs if p in test_pairs_set]
         
-        print(f"Data Split (Strip k={k}): Train {len(train_pairs)}, Test {len(test_pairs)}")
-
     elif style == 'rect':
-        # Logic from rec.py: Test set is square region [0, k] x [0, k]
-        # Train set is everything else (fraction is ignored)
+        # Hold out k x k square
         test_pairs_set = set((i, j) for i in range(k + 1) for j in range(k + 1))
-        
         train_pairs = [p for p in all_pairs if p not in test_pairs_set]
-        test_pairs = list(test_pairs_set)
+        test_pairs = [p for p in all_pairs if p in test_pairs_set]
         
-        print(f"Data Split (Rect k={k}): Train {len(train_pairs)}, Test {len(test_pairs)}")
-
-    else: # style == 'random'
-        # Logic: Random shuffle, then split by fraction
-        import random
-        random.seed(seed)
-        random.shuffle(all_pairs)
-        
+    else: 
         num_total = len(all_pairs)
         num_train = int(fraction * num_total)
         
         train_pairs = all_pairs[:num_train]
         test_pairs = all_pairs[num_train:]
-        
-        # print(f"Data Split (Random {fraction}): Train {len(train_pairs)}, Test {len(test_pairs)}")
 
-    # 3. Convert to Tensors
+    # Helper to convert to tensor
     def to_tensors(pairs_list):
         if not pairs_list:
             return torch.empty((0, 2), dtype=torch.long).to(DEVICE), torch.empty((0), dtype=torch.long).to(DEVICE)
@@ -117,10 +91,11 @@ def create_data(p, fraction, style='random', k=30, seed=42):
     return train_x, train_y, test_x, test_y
 
 # ===========================
-# 3. Training & Evaluation
+# 3. Training & Plotting Core
 # ===========================
 
 def evaluate(model, x, y, criterion):
+    if len(x) == 0: return 0.0, 0.0
     model.eval()
     with torch.no_grad():
         logits = model(x)
@@ -131,32 +106,19 @@ def evaluate(model, x, y, criterion):
     model.train()
     return loss.item(), acc
 
-def run_training(var_value, run_style):
+def train_single_run(val, style):
     """
-    Runs one training session. 
-    var_value is either 'fraction' (if random) or 'k' (if str/rec), 
-    but for the 3x3 grid we assume iterating fractions.
+    Trains a single model.
+    val: is 'fraction' if style='random', else it is 'k'.
     """
+    # Determine args
+    frac = val if style == 'random' else 0
+    k_val = val if style != 'random' else 0
     
-    # Determine arguments based on style
-    if run_style == 'random':
-        curr_frac = var_value
-        curr_k = 0 # Ignored
-        print(f"--- Training | Style: {run_style} | Fraction: {curr_frac} ---")
-    else:
-        curr_frac = 0 # Ignored
-        curr_k = var_value # This would need to be passed if iterating K
-        print(f"--- Training | Style: {run_style} | k: {curr_k} ---")
-
     # Generate Data
-    train_x, train_y, test_x, test_y = create_data(
-        P, 
-        fraction=curr_frac, 
-        style=run_style, 
-        k=curr_k
-    )
+    train_x, train_y, test_x, test_y = create_data(P, fraction=frac, style=style, k=k_val, seed=SEED)
     
-    # Model Config (Matches paper: 1 Layer, MLP enabled)
+    # Model Config
     cfg = Config(
         p=P,
         d_model=128,
@@ -167,30 +129,35 @@ def run_training(var_value, run_style):
         d_vocab=P+1,
         act_type='ReLU',
         use_ln=False,
-        seed=42
+        seed=SEED
     )
     
     model = Transformer(cfg).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss()
     
-    history_records = []
+    history = []
     
+    # Training Loop
     for step in range(TOTAL_STEPS + 1):
         model.train()
         optimizer.zero_grad()
         
-        logits = model(train_x)
-        loss = criterion(logits[:, -1, :], train_y)
-        loss.backward()
-        optimizer.step()
+        if len(train_x) > 0:
+            logits = model(train_x)
+            loss = criterion(logits[:, -1, :], train_y)
+            loss.backward()
+            optimizer.step()
+        else:
+            # Handle edge case if train set is empty (e.g. extreme k)
+            loss = torch.tensor(0.0)
         
         if step % LOG_EVERY == 0:
             train_loss, train_acc = evaluate(model, train_x, train_y, criterion)
             test_loss, test_acc = evaluate(model, test_x, test_y, criterion)
             
-            history_records.append({
-                'variable': var_value, # fraction or k
+            history.append({
+                'variable': val,
                 'step': step,
                 'train_loss': train_loss,
                 'test_loss': test_loss,
@@ -198,88 +165,168 @@ def run_training(var_value, run_style):
                 'test_acc': test_acc
             })
             
-    return history_records
+    return history
+
+def run_experiment_batch(name, style, values_list):
+    print(f"\n=== Starting Experiment: {name} (Style: {style}) ===")
+    print(f"Values to run: {values_list}")
+    
+    all_data = []
+    
+    # Run training for each value in the list
+    for val in tqdm(values_list, desc=f"Running {name}"):
+        run_history = train_single_run(val, style)
+        all_data.extend(run_history)
+        
+    # Save CSV
+    df = pd.DataFrame(all_data)
+    csv_filename = f"{name}.csv"
+    df.to_csv(csv_filename, index=False)
+    print(f"Saved data to {csv_filename}")
+    
+    # Generate Plots
+    print("Generating plots...")
+    generate_plots(df, name, style, values_list)
+
+def plot_dataset_distribution(ax, train_x, test_x, p):
+    """
+    Visualizes the dataset distribution (Train vs Test).
+    Train_x and Test_x are (N, 2) tensors containing (i, j) pairs.
+    Plotting logic:
+    - x-axis: Column index (j)
+    - y-axis: Row index (i)
+    - Invert y-axis to match matrix visualization (row 0 at top).
+    """
+    # Convert to CPU numpy for plotting
+    def to_cpu(t):
+        return t.cpu().numpy()
+        
+    train_data = to_cpu(train_x)
+    test_data = to_cpu(test_x)
+    
+    # In to_tensors: inputs = stack([x, y], dim=1) -> [i, j]
+    # So col 0 is i (row), col 1 is j (col)
+    
+    # Plot Test first (background)
+    if len(test_data) > 0:
+        # Scatter(j, i) -> (col, row)
+        ax.scatter(test_data[:, 1], test_data[:, 0], c='lightgrey', s=2, marker='s', label='Test')
+        
+    # Plot Train
+    if len(train_data) > 0:
+        ax.scatter(train_data[:, 1], train_data[:, 0], c='tab:blue', s=2, marker='s', label='Train')
+        
+    ax.set_xlim(-0.5, p - 0.5)
+    ax.set_ylim(-0.5, p - 0.5)
+    ax.invert_yaxis() # Put row 0 at the top
+    ax.set_aspect('equal')
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+def generate_plots(df, name, style, values_list):
+    """
+    Generates a combined figure for the experiment batch.
+    Rows: Each value in values_list
+    Cols: 3 (Distribution, Loss, Accuracy)
+    """
+    num_vals = len(values_list)
+    cols = 3
+    rows = num_vals
+    
+    # Increase figure height to accommodate all rows
+    fig_width = 15 # 5 * 3
+    fig_height = 4 * rows
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
+    
+    # Handle single row case where axes is 1D array
+    if rows == 1:
+        axes = np.array([axes])
+        
+    for i, val in enumerate(values_list):
+        # --- Column 1: Dataset Distribution ---
+        ax_dist = axes[i, 0]
+        
+        # Regenerate data to visualize the split
+        frac = val if style == 'random' else 0
+        k_val = val if style != 'random' else 0
+        
+        # Note: calling create_data again. Since seed is fixed, it should be deterministic.
+        train_x, train_y, test_x, test_y = create_data(P, fraction=frac, style=style, k=k_val, seed=SEED)
+        
+        plot_dataset_distribution(ax_dist, train_x, test_x, P)
+        
+        label_title = f"{style.capitalize()} " + (f"Fraction {val}" if style == 'random' else f"k = {val}")
+        ax_dist.set_title(label_title, fontsize=10, fontweight='bold')
+        if i == 0: # Legend only on first row or specific place? 
+            # Often cleaner without legend if colors are obvious, or put legend outside
+            # Let's add a small legend
+            ax_dist.legend(loc='upper right', fontsize=8)
+
+        # Filter data for this value
+        subset = df[df['variable'] == val]
+        
+        # --- Column 2: Loss ---
+        ax_loss = axes[i, 1]
+        
+        if not subset.empty:
+            ax_loss.semilogy(subset['step'], subset['train_loss'], label='Train', color='tab:blue')
+            ax_loss.semilogy(subset['step'], subset['test_loss'], label='Test', color='lightgrey') # Grey for test match
+            ax_loss.set_title("Loss", fontsize=10)
+            ax_loss.grid(True, which="both", ls="--", alpha=0.3)
+            if i == 0: ax_loss.legend()
+        else:
+            ax_loss.text(0.5, 0.5, "No Data", ha='center', va='center')
+
+        # --- Column 3: Accuracy ---
+        ax_acc = axes[i, 2]
+        
+        if not subset.empty:
+            ax_acc.plot(subset['step'], subset['train_acc'], label='Train', color='tab:blue')
+            ax_acc.plot(subset['step'], subset['test_acc'], label='Test', color='grey') # Grey for test match
+            ax_acc.set_title("Accuracy", fontsize=10)
+            ax_acc.set_ylim(-0.05, 1.05)
+            ax_acc.grid(True, alpha=0.3)
+            if i == 0: ax_acc.legend(loc='lower right')
+        else:
+            ax_acc.text(0.5, 0.5, "No Data", ha='center', va='center')
+
+    plt.tight_layout()
+    plot_filename = f"{name}_combined.png"
+    plt.savefig(plot_filename, dpi=150)
+    print(f"Saved combined plots to {plot_filename}")
+
 
 # ===========================
 # 4. Main Execution
 # ===========================
 
 if __name__ == "__main__":
-    all_data = []
-
-    # We assume 'random' style for the 3x3 fraction grid request.
-    # If you want to run 'rec' or 'strip', change EXPERIMENT_STYLE at the top
-    # and provide a list of K values instead of FRACTIONS.
     
-    loop_values = FRACTIONS if EXPERIMENT_STYLE == 'random' else [K_VALUE] 
+    # 1. Fraction range 0.1 to 0.9 (random shuffle)
+    # Using np.round to avoid floating point ugliness in filenames/titles
+    fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    run_experiment_batch(
+        name="experiment_1_fraction",
+        style="random",
+        values_list=fractions
+    )
     
-    for val in tqdm(loop_values, desc="Runs"):
-        history = run_training(val, EXPERIMENT_STYLE)
-        all_data.extend(history)
-
-    # Save CSV
-    df = pd.DataFrame(all_data)
-    csv_filename = "grokking_experiment_data.csv"
-    df.to_csv(csv_filename, index=False)
-    print(f"\nTraining complete. Data saved to {csv_filename}")
-
-    # ===========================
-    # 5. Plotting (3x3 Grid)
-    # ===========================
+    # 2. Square range k=30 to 60 with step 5 (rect)
+    # range(start, stop, step) -> stop is exclusive, so 65 to include 60
+    k_square = [30, 35, 40, 45, 50, 55, 60] 
+    run_experiment_batch(
+        name="experiment_2_square",
+        style="rect",
+        values_list=k_square
+    )
     
-    # Only generate 3x3 grid if we have 9 items (standard for the fraction sweep)
-    if len(loop_values) == 9:
-        
-        # --- 1. Accuracy Plot ---
-        fig_acc, axes_acc = plt.subplots(3, 3, figsize=(15, 12))
-        axes_acc = axes_acc.flatten()
-        
-        for i, val in enumerate(loop_values):
-            ax = axes_acc[i]
-            subset = df[df['variable'] == val]
-            
-            ax.plot(subset['step'], subset['train_acc'], label='Train', color='blue')
-            ax.plot(subset['step'], subset['test_acc'], label='Test', color='red')
-            
-            label_name = "Fraction" if EXPERIMENT_STYLE == 'random' else "k"
-            ax.set_title(f"{label_name} {val}")
-            ax.set_ylim(-0.05, 1.05)
-            ax.grid(True, alpha=0.3)
-            
-            if i >= 6: ax.set_xlabel("Steps")
-            if i % 3 == 0: ax.set_ylabel("Accuracy")
-            if i == 0: ax.legend(loc="lower right")
-
-        plt.suptitle(f"Grokking Accuracy ({EXPERIMENT_STYLE})", fontsize=16)
-        plt.tight_layout()
-        plt.savefig("grokking_accuracy_grid.png", dpi=150)
-        print("Saved accuracy plot.")
-
-        # --- 2. Loss Plot ---
-        fig_loss, axes_loss = plt.subplots(3, 3, figsize=(15, 12))
-        axes_loss = axes_loss.flatten()
-        
-        for i, val in enumerate(loop_values):
-            ax = axes_loss[i]
-            subset = df[df['variable'] == val]
-            
-            ax.semilogy(subset['step'], subset['train_loss'], label='Train', color='blue')
-            ax.semilogy(subset['step'], subset['test_loss'], label='Test', color='red')
-            
-            label_name = "Fraction" if EXPERIMENT_STYLE == 'random' else "k"
-            ax.set_title(f"{label_name} {val}")
-            ax.grid(True, which="both", ls="--", alpha=0.3)
-            
-            if i >= 6: ax.set_xlabel("Steps")
-            if i % 3 == 0: ax.set_ylabel("Loss (Log Scale)")
-            if i == 0: ax.legend(loc="upper right")
-
-        plt.suptitle(f"Grokking Loss ({EXPERIMENT_STYLE})", fontsize=16)
-        plt.tight_layout()
-        plt.savefig("grokking_loss_grid.png", dpi=150)
-        print("Saved loss plot.")
-        
-    else:
-        print("Plotting skipped or basic plot generated (Run count != 9). check CSV for data.")
+    # 3. Stripe range k=40 to 70 with step 10 (strip)
+    # range(start, stop, step) -> stop is exclusive, so 80 to include 70
+    k_stripe = [40, 50, 60, 70]
+    run_experiment_batch(
+        name="experiment_3_stripe",
+        style="strip",
+        values_list=k_stripe
+    )
     
-    plt.show()
+    print("\nAll experiments completed.")
