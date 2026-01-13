@@ -14,7 +14,7 @@ class FractionConfig:
 
     # Activation Collection
     collect_activations: bool = True
-    collect_every: int = 10
+    collect_every: int = 100
     collect_layers: List[str] = field(default_factory=lambda: ['blocks.0.mlp.hook_post'])
     save_dir: str = "activations"
 
