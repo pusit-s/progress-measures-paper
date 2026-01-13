@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.optim as optim
 import sys
+import os
 from fraction_config import FractionConfig
 from fraction_data import FractionDataManager
 
@@ -65,6 +67,16 @@ class FractionTrainer:
         
         history = []
         
+        # Activation Collection setup
+        activations_history = {}
+        all_data = None
+        if self.config.collect_activations:
+            # Generate all possible data pairs (0..p-1, 0..p-1)
+            # Create a simple list of pairs.
+            all_pairs = [(i, j) for i in range(self.config.p) for j in range(self.config.p)]
+            # Use data manager to get tensors
+            all_data, _ = self.data_manager.to_tensors(all_pairs)
+
         # Training Loop
         for step in range(self.config.total_steps + 1):
             model.train()
@@ -90,5 +102,50 @@ class FractionTrainer:
                     'train_acc': train_acc,
                     'test_acc': test_acc
                 })
+            
+            # Collect Activations
+            if self.config.collect_activations and (step % self.config.collect_every == 0):
+                model.eval()
+                cache = {}
+                with torch.no_grad():
+                    # We need to use hook mechanism from transformers.py
+                    # The Transformer class has cache_all method
+                    model.remove_all_hooks()
+                    model.cache_all(cache)
+                    
+                    # Forward pass on all_data
+                    # all_data shape is [batch, 2]
+                    # Data needs to be formatted as (x, y, p) tuples for config.fn or just passed to model? 
+                    # The model expects [batch, 2] tensor for embedding if simplified, 
+                    # BUT looking at transformers.py:
+                    # forward takes x. x is [batch, 2]? 
+                    # Embed.forward uses x.
+                    # Let's check Embed.forward: returns t.einsum('dbp -> bpd', self.W_E[:, x])
+                    # x should be indices. so [batch, n_ctx]
+                    
+                    # Our all_data is [batch, 2] (x, y)
+                    
+                    # We need access to intermediate activations.
+                    # We can use the cache populated by cache_all.
+                    
+                    _ = model(all_data)
+                    
+                    step_acts = {}
+                    for layer_name in self.config.collect_layers:
+                        if layer_name in cache:
+                            # Move to CPU to save memory
+                            step_acts[layer_name] = cache[layer_name].cpu()
+                    
+                    activations_history[step] = step_acts
+                    
+                    model.remove_all_hooks()
+                model.train()
+
+        # Save activations
+        if self.config.collect_activations:
+            os.makedirs(self.config.save_dir, exist_ok=True)
+            save_path = os.path.join(self.config.save_dir, f"{style}_{val}_activations.pth")
+            torch.save(activations_history, save_path)
+            print(f"Saved activations to {save_path}")
                 
         return history

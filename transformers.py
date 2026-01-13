@@ -297,14 +297,16 @@ class Transformer(nn.Module):
             model=[self]) for i in range(config.num_layers)])
         self.unembed = Unembed(d_vocab = config.d_vocab, d_model = config.d_model)
         self.use_ln = use_ln
+        self.hook_embed = HookPoint()
+        self.hook_pos_embed = HookPoint()
 
         for name, module in self.named_modules():
             if type(module)==HookPoint:
                 module.give_name(name)
     
     def forward(self, x):
-        x = self.embed(x)
-        x = self.pos_embed(x)
+        x = self.hook_embed(self.embed(x))
+        x = self.hook_pos_embed(self.pos_embed(x))
         for block in self.blocks:
             x = block(x)
         # x = self.ln(x)
@@ -350,7 +352,7 @@ def make_fourier_basis(config: Config):
     return t.stack(fourier_basis, dim=0).to(config.device)
 
 
-def calculate_key_freqs(config: Config, model: Transformer, all_data):
+def calculate_key_freqs(config: Config, model: Transformer, all_data, return_individual=False):
     # TODO this was moved from the app code; probably move it around
     labels = t.tensor([config.fn(i, j) for i, j, _ in all_data]).to(config.device)
     cache = {}
@@ -385,6 +387,10 @@ def calculate_key_freqs(config: Config, model: Transformer, all_data):
         neuron_frac_explained.append(best_frac_explained)
     neuron_freqs = np.array(neuron_freqs)
     neuron_frac_explained = helpers.to_numpy(neuron_frac_explained)
+    
+    if return_individual:
+        return neuron_freqs, neuron_frac_explained
+
     key_freqs, neuron_freq_counts = np.unique(neuron_freqs, return_counts=True)
     return key_freqs
 

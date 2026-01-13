@@ -12,6 +12,12 @@ class FractionConfig:
     seed: int = 42
     device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
+    # Activation Collection
+    collect_activations: bool = True
+    collect_every: int = 10
+    collect_layers: List[str] = field(default_factory=lambda: ['blocks.0.mlp.hook_post'])
+    save_dir: str = "activations"
+
     # Transformer Config
     d_model: int = 128
     num_heads: int = 4
