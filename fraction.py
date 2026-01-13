@@ -43,35 +43,27 @@ random.seed(SEED)
 # 2. Data Generation Logic
 # ===========================
 
-def create_data(p, fraction, style=None, k=30, seed=42):
+def create_data(p, fraction=0.3, style=None, k=30, seed=42):
     """
     Generates data based on the specific style:
     - random (or None): Uses 'fraction' to split train/test.
-    - strip: Holds out rows 0..k for Test. Ignores fraction.
-    - rect: Holds out square 0..k x 0..k for Test. Ignores fraction.
+    - strip: Holds out rows 0..k for Test. Samples 'fraction' of remaining for Train.
+    - rect: Holds out square 0..k x 0..k for Test. Samples 'fraction' of remaining for Train.
     """
     random.seed(seed)
     all_pairs = [(i, j) for i in range(p) for j in range(p)]
-    random.shuffle(all_pairs)
     
+    test_set = set()
     if style == 'strip':
-        # Hold out first k rows
-        test_pairs_set = set((i, j) for i in range(k + 1) for j in range(p))
-        train_pairs = [p for p in all_pairs if p not in test_pairs_set]
-        test_pairs = [p for p in all_pairs if p in test_pairs_set]
-        
+        test_set = {(i, j) for i in range(k + 1) for j in range(p)}
     elif style == 'rect':
-        # Hold out k x k square
-        test_pairs_set = set((i, j) for i in range(k + 1) for j in range(k + 1))
-        train_pairs = [p for p in all_pairs if p not in test_pairs_set]
-        test_pairs = [p for p in all_pairs if p in test_pairs_set]
-        
-    else: 
-        num_total = len(all_pairs)
-        num_train = int(fraction * num_total)
-        
-        train_pairs = all_pairs[:num_train]
-        test_pairs = all_pairs[num_train:]
+        test_set = {(i, j) for i in range(k + 1) for j in range(k + 1)}
+    
+    remaining = [p for p in all_pairs if p not in test_set]
+    random.shuffle(remaining)
+    num_train = int(fraction * len(remaining))
+    train_pairs = remaining[:num_train]
+    test_pairs = [p for p in all_pairs if p in test_set] if test_set else remaining[num_train:]
 
     # Helper to convert to tensor
     def to_tensors(pairs_list):
@@ -111,9 +103,13 @@ def train_single_run(val, style):
     Trains a single model.
     val: is 'fraction' if style='random', else it is 'k'.
     """
-    # Determine args
-    frac = val if style == 'random' else 0
-    k_val = val if style != 'random' else 0
+
+    if (style == 'rect' or style == 'strip'):
+        frac = 0.3
+        k_val = val
+    else:
+        frac = val
+        k_val = 0 
     
     # Generate Data
     train_x, train_y, test_x, test_y = create_data(P, fraction=frac, style=style, k=k_val, seed=SEED)
@@ -246,11 +242,13 @@ def generate_plots(df, name, style, values_list):
         # --- Column 1: Dataset Distribution ---
         ax_dist = axes[i, 0]
         
-        # Regenerate data to visualize the split
-        frac = val if style == 'random' else 0
-        k_val = val if style != 'random' else 0
+        if (style == 'rect' or style == 'strip'):
+            frac = 0.3
+            k_val = val
+        else:
+            frac = val
+            k_val = 0
         
-        # Note: calling create_data again. Since seed is fixed, it should be deterministic.
         train_x, train_y, test_x, test_y = create_data(P, fraction=frac, style=style, k=k_val, seed=SEED)
         
         plot_dataset_distribution(ax_dist, train_x, test_x, P)
